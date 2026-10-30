@@ -1,0 +1,14 @@
+{
+  "domain": "origin_energy",
+  "name": "Origin Energy",
+  "codeowners": ["@tkargas"],
+  "config_flow": true,
+  "dependencies": ["recorder"],
+  "documentation": "https://github.com/tkargas/ha-origin-energy-extended",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/tkargas/ha-origin-energy-extended/issues",
+  "loggers": ["custom_components.origin_energy"],
+  "requirements": [],
+  "version": "0.3.0"
+}

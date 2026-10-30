@@ -1,0 +1,21 @@
+# Your live session cookie. Treat it like a password.
+origin_secrets.env
+tools/origin_secrets.env
+
+# Network captures hold your account number, NMI, tokens and personal
+# details even after sanitising -- keep them out of version control.
+*.har
+*.sanitized.json
+
+# Usage exports from Origin. The filename alone carries your account
+# reference and agreement id.
+*-ELECTRICITY-*.csv
+*-GAS-*.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Rendered previews from the brand asset generator
+brands/preview.png
