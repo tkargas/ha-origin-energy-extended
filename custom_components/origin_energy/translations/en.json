@@ -34,16 +34,21 @@
         "description": "Origin publishes each day's usage in a single overnight batch, but the time it lands moves around by several hours. Polling more often than once a day means a late batch is still picked up the same day.\n\nEach poll is a single request, and re-reading a day that was already imported is harmless — it just corrects it.",
         "data": {
           "update_interval_hours": "Update interval (hours)",
-          "manual_statistic_id": "Manual statistic (optional)"
+          "manual_statistic_id": "Manual statistic (optional)",
+          "reset_origin_statistics": "Clear Origin's imported data now and re-import after the manual data (one time)"
         },
         "data_description": {
           "update_interval_hours": "How often to check Origin for new usage data. Default is 4 hours; 24 restores the original once-a-day behaviour.",
-          "manual_statistic_id": "The id of a statistic that already holds hand-entered readings for this meter, e.g. sensor.electricity_meter_total (see Developer tools > Statistics). Origin's hours up to that statistic's last value are skipped, so only later hours are added. It is only read, never changed. Leave blank to import everything."
+          "manual_statistic_id": "The id of a statistic that already holds hand-entered readings for this meter, e.g. sensor.electricity_meter_total (see Developer tools > Statistics). Origin's hours up to that statistic's last value are skipped, so only later hours are added. It is only read, never changed. Leave blank to import everything.",
+          "reset_origin_statistics": "Use this if Origin's data and your manual data both show for the same days (double counted). It deletes Origin Energy's imported consumption and cost statistics, then re-imports only the hours after your manual statistic's last value. Origin data for earlier hours is not brought back. Your manual statistic is never touched. It resets to off afterwards."
         }
       }
     },
     "error": {
-      "invalid_statistic_id": "That is not a statistic id. Use an entity id such as sensor.electricity_meter_total, or leave it blank."
+      "invalid_statistic_id": "That is not a statistic id. Use an entity id such as sensor.electricity_meter_total, or leave it blank.",
+      "reset_needs_statistic": "Enter the manual statistic first. Clearing without one would just re-import everything.",
+      "reset_not_loaded": "The integration is not running. Reload it, then try again.",
+      "reset_timed_out": "Home Assistant did not finish clearing the statistics in time. Try again in a minute."
     }
   },
   "entity": {

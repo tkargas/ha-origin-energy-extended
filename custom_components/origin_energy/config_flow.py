@@ -22,6 +22,7 @@ from homeassistant.config_entries import (
 from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.selector import (
+    BooleanSelector,
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
@@ -44,6 +45,7 @@ from .const import (
     AUTH_DOMAIN,
     CONF_AGREEMENT_ID,
     CONF_MANUAL_STATISTIC_ID,
+    CONF_RESET_STATISTICS,
     CONF_SESSION_COOKIE,
     CONF_TIME_UNIT,
     CONF_TIMEZONE,
@@ -241,6 +243,13 @@ class OriginEnergyOptionsFlow(OptionsFlow):
             except ValueError:
                 errors[CONF_MANUAL_STATISTIC_ID] = "invalid_statistic_id"
             else:
+                reset = bool(user_input.get(CONF_RESET_STATISTICS))
+                coordinator = getattr(self.config_entry, "runtime_data", None)
+                if reset and not manual_id:
+                    errors[CONF_RESET_STATISTICS] = "reset_needs_statistic"
+                elif reset and coordinator is None:
+                    errors[CONF_RESET_STATISTICS] = "reset_not_loaded"
+            if not errors:
                 data: dict[str, Any] = {
                     # The number selector hands back a float; storing the
                     # int keeps the stored options readable and avoids
@@ -254,7 +263,21 @@ class OriginEnergyOptionsFlow(OptionsFlow):
                 # cleared.
                 if manual_id:
                     data[CONF_MANUAL_STATISTIC_ID] = manual_id
-                return self.async_create_entry(data=data)
+                if reset:
+                    # Saved first so the coordinator sees the new id, then
+                    # the one-time clear runs. The tick-box itself is not
+                    # stored, so it is off again next time.
+                    self.hass.config_entries.async_update_entry(
+                        self.config_entry, options=data
+                    )
+                    try:
+                        await coordinator.async_reset_for_manual_statistic(manual_id)
+                    except ValueError:
+                        errors[CONF_MANUAL_STATISTIC_ID] = "invalid_statistic_id"
+                    except TimeoutError:
+                        errors[CONF_RESET_STATISTICS] = "reset_timed_out"
+                if not errors:
+                    return self.async_create_entry(data=data)
 
         current = self.config_entry.options.get(
             CONF_UPDATE_INTERVAL_HOURS, DEFAULT_UPDATE_INTERVAL_HOURS
@@ -278,6 +301,7 @@ class OriginEnergyOptionsFlow(OptionsFlow):
                         CONF_MANUAL_STATISTIC_ID,
                         description={"suggested_value": current_manual},
                     ): TextSelector(),
+                    vol.Optional(CONF_RESET_STATISTICS, default=False): BooleanSelector(),
                 }
             ),
             errors=errors,

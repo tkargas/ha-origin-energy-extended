@@ -166,6 +166,13 @@ written). Origin's series carries on from its own running total.
   growing (a live sensor, or more manual rows later), Origin's cut-off
   moves with it. Hours Origin has already written stay as they are; use
   **Developer tools → Statistics** to remove any that now overlap.
+- **Already seeing it counted twice?** If Origin's series was imported before
+  you set this option, its older hours still overlap your manual ones. In
+  the same Configure dialog tick **Clear Origin's imported data now…** and
+  submit. That deletes Origin's two statistics (never yours) and re-imports
+  only hours after your manual statistic's last value. Origin hours before
+  that are not brought back, so your manual statistic must cover that
+  period. It resets to off afterwards.
 - A mistyped id stops the import with an error in the log rather than
   writing over your manual hours. Clear the field to go back to importing
   everything.

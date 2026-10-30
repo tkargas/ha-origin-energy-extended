@@ -59,6 +59,9 @@ CONF_UPDATE_INTERVAL_HOURS = "update_interval_hours"
 # added. It is only ever read, never written. Also an option, not data, so it
 # can be changed from the Configure dialog at any time.
 CONF_MANUAL_STATISTIC_ID = "manual_statistic_id"
+# Not stored: a tick-box in the options dialog that clears Origin's own
+# statistics so they are re-imported after the manual statistic.
+CONF_RESET_STATISTICS = "reset_origin_statistics"
 # Set once the historical backfill has run to completion. Until it is set
 # the backfill restarts from the beginning, so an interrupted one (a
 # restart mid-run) resumes rather than leaving a permanent hole.

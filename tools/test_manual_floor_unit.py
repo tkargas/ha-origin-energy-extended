@@ -213,6 +213,11 @@ class Store:
                 out[sid] = got
         return out
 
+    def clear(self, statistic_ids):
+        self.cleared = list(statistic_ids)
+        for sid in statistic_ids:
+            self.rows.pop(sid, None)
+
     def add_external(self, hass, metadata, stats):
         for row in stats:
             self.put(metadata["statistic_id"], row["start"], row["state"], row["sum"])
@@ -258,7 +263,10 @@ class FakeOrigin:
 
 def make(store, origin, manual_id=None, backfill_start=None):
     store_ns = types.SimpleNamespace(
-        get_instance=lambda hass: types.SimpleNamespace(async_add_executor_job=_run_job),
+        get_instance=lambda hass: types.SimpleNamespace(
+            async_add_executor_job=_run_job,
+            async_clear_statistics=store.clear,
+        ),
         get_last_statistics=store.get_last_statistics,
         statistics_during_period=store.statistics_during_period,
         async_add_external_statistics=store.add_external,
@@ -280,6 +288,7 @@ def make(store, origin, manual_id=None, backfill_start=None):
     c._backfill_task = None
     c._import_lock = asyncio.Lock()
     c.backfill_started = 0
+    c.async_request_refresh = lambda: None
 
     async def _api():
         return origin
@@ -433,6 +442,31 @@ run(c._async_import_recent())
 check("nothing written", store.writes, [])
 
 # ---- H: option change is noticed ------------------------------------------------
+print("I. clear Origin's overlapping history, then re-import after the manual data")
+store = Store()
+origin = FakeOrigin(hr(20, 0), hr(29, 23))
+c0 = make(store, origin, None)
+run(c0._async_backfill())
+put_manual(store, hr(20, 0), hr(28, 23))
+manual_before = store.snapshot(MANUAL)
+check("setup: Origin's series double covers the manual days", hr(25, 0) in store.snapshot(OWN), True)
+c = make(store, origin, None)
+c.config_entry.data = {"backfill_complete": True}
+run(c.async_reset_for_manual_statistic(MANUAL))
+check("only Origin's own two statistics were cleared", sorted(store.cleared), sorted([OWN, OWN_COST]))
+check("Origin's series is empty", store.snapshot(OWN), {})
+check("manual untouched", store.snapshot(MANUAL), manual_before)
+check("backfill flag turned off", c.hass.config_entries.async_update_entry.call_args.kwargs["data"]["backfill_complete"], False)
+run(c._async_backfill())
+own = store.snapshot(OWN)
+check("re-import adds only hours after the manual data", sorted(own), hours(hr(29, 0), hr(29, 23)))
+check("manual still untouched", store.snapshot(MANUAL), manual_before)
+try:
+    run(make(Store(), origin, None).async_reset_for_manual_statistic(OWN))
+    check("manual id equal to Origin's own id is refused", "accepted", "ValueError")
+except ValueError:
+    check("manual id equal to Origin's own id is refused", "ValueError", "ValueError")
+
 print("H. adopting a changed option")
 c = make(Store(), FakeOrigin(hr(20, 0), hr(29, 23)), None)
 check("no change -> False", c.async_adopt_manual_statistic(), False)

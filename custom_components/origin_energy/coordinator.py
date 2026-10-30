@@ -232,6 +232,55 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
         self._manual_statistic_id = statistic_id
         return True
 
+    async def async_reset_for_manual_statistic(self, manual_statistic_id: str) -> None:
+        """Drop Origin's own statistics and re-import them after the manual one.
+
+        For when Origin's series already holds hours the manual statistic
+        covers: those can't be removed one at a time, and left alone they
+        count twice on the Energy dashboard. Only Origin's two statistics
+        are cleared -- never the manual one -- and everything cleared is
+        re-fetchable from Origin, except hours before the manual statistic's
+        last row, which are deliberately not re-imported.
+        """
+        own_ids = [self.consumption_statistic_id, self.cost_statistic_id]
+        if manual_statistic_id in own_ids:
+            raise ValueError("The manual statistic cannot be Origin's own statistic")
+        self._manual_statistic_id = manual_statistic_id
+
+        if self._backfill_task is not None:
+            self._backfill_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._backfill_task
+            self._backfill_task = None
+
+        async with self._import_lock:
+            instance = get_instance(self.hass)
+            instance.async_clear_statistics(own_ids)
+            # Clearing is queued on the recorder rather than done in place,
+            # and the signature for waiting on it has varied between
+            # releases, so wait for the visible effect instead.
+            for _ in range(60):
+                rows = await instance.async_add_executor_job(
+                    get_last_statistics,
+                    self.hass,
+                    1,
+                    self.consumption_statistic_id,
+                    True,
+                    set(),
+                )
+                if not rows:
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                raise TimeoutError("Timed out waiting for the statistics to clear")
+
+        # Backfill again from the start, now bounded by the manual statistic.
+        self.hass.config_entries.async_update_entry(
+            self.config_entry,
+            data={**self.config_entry.data, CONF_BACKFILL_COMPLETE: False},
+        )
+        self.hass.async_create_task(self.async_request_refresh())
+
     async def async_close(self) -> None:
         """Stop the backfill before the entry finishes unloading.
 
