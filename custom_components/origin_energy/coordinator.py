@@ -14,8 +14,8 @@ import asyncio
 import logging
 import re
 from contextlib import suppress
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, tzinfo
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -58,7 +58,6 @@ from .const import (
     CONF_AGREEMENT_ID,
     CONF_BACKFILL_COMPLETE,
     CONF_MANUAL_STATISTIC_ID,
-    CONF_MANUAL_UNTIL_DATE,
     CONF_SESSION_COOKIE,
     CONF_TIME_UNIT,
     CONF_TIMEZONE,
@@ -71,14 +70,11 @@ from .const import (
     MIN_UPDATE_INTERVAL_HOURS,
     OVERLAP_DAYS,
 )
-from .manual_floor import (
-    ManualFloor,
-    configured_manual_until,
+from .manual_days import (
     configured_statistic_id,
-    floor_from_date,
-    floor_from_last_statistics,
-    later_start,
-    not_before_floor,
+    days_with_manual_data,
+    expand_to_local_days,
+    local_day,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -157,6 +153,14 @@ class _ImportCursor:
     cost_sum: float = 0.0
     last_start: datetime | None = None
     written: int = 0
+    # Local days that already have manual data: Origin's hours on those days
+    # are not written. `existing` holds the sums of rows this series already
+    # has inside the import range, so that when a skipped hour has one the
+    # running sums carry on from it rather than from before it.
+    skip_days: frozenset[date] = frozenset()
+    skip_tz: tzinfo | None = None
+    existing: dict[datetime, tuple[float, float]] = field(default_factory=dict)
+    skipped: int = 0
 
 
 class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
@@ -189,9 +193,6 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
         self._manual_statistic_id = configured_statistic_id(
             config_entry.options, CONF_MANUAL_STATISTIC_ID
         )
-        self._manual_until = configured_manual_until(
-            config_entry.options, CONF_MANUAL_UNTIL_DATE
-        )
         self._backfill_task: asyncio.Task[None] | None = None
         # Guards the statistics import so a background backfill and a
         # scheduled update can't interleave and corrupt the running sums.
@@ -222,47 +223,37 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
     def async_adopt_manual_statistic(self) -> bool:
         """Take up a newly-configured manual statistic. True if it changed.
 
-        Nothing is cached beyond the id itself: the statistic's last row is
-        read on every update, so a changed id only needs a refresh to apply.
+        Nothing is cached beyond the id itself: the manual statistic is read
+        on every import, so a changed id only needs a refresh to apply.
         """
         statistic_id = configured_statistic_id(
             self.config_entry.options, CONF_MANUAL_STATISTIC_ID
         )
-        manual_until = configured_manual_until(
-            self.config_entry.options, CONF_MANUAL_UNTIL_DATE
-        )
-        if (
-            statistic_id == self._manual_statistic_id
-            and manual_until == self._manual_until
-        ):
+        if statistic_id == self._manual_statistic_id:
             return False
         _LOGGER.debug(
-            "Origin Energy manual cut-off changed from %s/%s to %s/%s",
+            "Origin Energy manual statistic changed from %s to %s",
             self._manual_statistic_id,
-            self._manual_until,
             statistic_id,
-            manual_until,
         )
         self._manual_statistic_id = statistic_id
-        self._manual_until = manual_until
         return True
 
     async def async_reset_for_manual_statistic(self) -> None:
-        """Drop Origin's own statistics and re-import them after the manual one.
+        """Drop Origin's own statistics and re-import them, skipping manual days.
 
-        For when Origin's series already holds hours the manual statistic
-        covers: those can't be removed one at a time, and left alone they
-        count twice on the Energy dashboard. Only Origin's two statistics
+        For when Origin's series already holds days that the manual statistic
+        also covers: those rows can't be removed one at a time, and left alone
+        they count twice on the Energy dashboard. Only Origin's two statistics
         are cleared -- never the manual one -- and everything cleared is
-        re-fetchable from Origin, except hours before the manual statistic's
-        last row, which are deliberately not re-imported.
+        re-fetchable from Origin.
         """
         own_ids = [self.consumption_statistic_id, self.cost_statistic_id]
         self.async_adopt_manual_statistic()
         if self._manual_statistic_id in own_ids:
             raise ValueError("The manual statistic cannot be Origin's own statistic")
-        if self._manual_statistic_id is None and self._manual_until is None:
-            raise ValueError("Set a manual statistic or a start date first")
+        if self._manual_statistic_id is None:
+            raise ValueError("Set a manual statistic first")
 
         if self._backfill_task is not None:
             self._backfill_task.cancel()
@@ -291,7 +282,7 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
             else:
                 raise TimeoutError("Timed out waiting for the statistics to clear")
 
-        # Backfill again from the start, now bounded by the manual statistic.
+        # Backfill again from the start, skipping the manual days.
         self.hass.config_entries.async_update_entry(
             self.config_entry,
             data={**self.config_entry.data, CONF_BACKFILL_COMPLETE: False},
@@ -405,18 +396,9 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
         try:
             async with self._import_lock:
                 start = await self._async_history_start()
-                cursor = _ImportCursor()
-                floor = await self._async_manual_floor()
-                if floor is not None:
-                    # Manual wins: nothing at or before its last hour. If this
-                    # series already has rows (an interrupted earlier run) the
-                    # sums must carry on from them, not restart at zero.
-                    start = not_before_floor(start, floor)
-                    cursor = await self._async_baseline_cursor(start) or cursor
-                    cursor.last_start = later_start(cursor.last_start, floor)
                 _LOGGER.debug("Backfilling Origin Energy usage from %s", start)
                 cursor = await self._async_import(
-                    start, dt_util.now(self.timezone), cursor
+                    start, dt_util.now(self.timezone), _ImportCursor()
                 )
         except asyncio.CancelledError:
             raise
@@ -469,11 +451,24 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
 
     async def _async_import_recent(self) -> None:
         """Extend the statistics with whatever has been published since."""
-        floor = await self._async_manual_floor()
         last_stat = await get_instance(self.hass).async_add_executor_job(
             get_last_statistics, self.hass, 1, self.consumption_statistic_id, True, set()
         )
         if not last_stat:
+            if self._manual_statistic_id is not None:
+                # With a manual statistic an empty series after a finished
+                # backfill usually means every day Origin had was already
+                # covered by manual data. Re-running the whole history on
+                # every poll would just fetch it all again to skip it, so
+                # take only the recent window.
+                _LOGGER.debug("No Origin Energy statistics yet, importing recent days")
+                now = dt_util.now(self.timezone)
+                await self._async_import(
+                    now - timedelta(days=OVERLAP_DAYS + 2),
+                    now + timedelta(minutes=1),
+                    _ImportCursor(),
+                )
+                return
             # The backfill was marked complete but produced nothing (a brand
             # new agreement with no readings yet). Try again from scratch.
             _LOGGER.debug("No Origin Energy statistics yet, re-running backfill")
@@ -501,19 +496,8 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
             )
 
         anchor = min(last_point, last_reading) if last_reading else last_point
-        # The revision overlap must not reach back into the manual hours:
-        # those hours belong to the manual statistic, so they are not ours
-        # to (re)write.
-        start = not_before_floor(anchor - timedelta(days=OVERLAP_DAYS), floor)
+        start = anchor - timedelta(days=OVERLAP_DAYS)
         end = max(last_reading or now, last_point) + timedelta(minutes=1)
-        if floor is not None and start >= end:
-            _LOGGER.debug(
-                "Origin Energy data (to %s) has not passed the manual statistic "
-                "(to %s) yet",
-                last_reading,
-                floor.last_start,
-            )
-            return
 
         cursor = await self._async_baseline_cursor(start)
         if cursor is None:
@@ -525,39 +509,9 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
             cursor = _ImportCursor(consumption_sum, cost_sum, last_point)
             start = last_point
 
-        # Skips every hour the manual statistic covers (a no-op without one).
-        cursor.last_start = later_start(cursor.last_start, floor)
         cursor = await self._async_import(start, end, cursor)
         if not cursor.written:
             _LOGGER.debug("No new Origin Energy usage data since last update")
-
-    async def _async_manual_floor(self) -> ManualFloor | None:
-        """Last hour covered by the manual data, if a cut-off is configured.
-
-        A fixed start date wins over the statistic: it does not move, which
-        a statistic that grows by itself would.
-
-        Raises rather than returning None when the statistic is configured
-        but holds nothing: carrying on would write Origin's data over the
-        very hours the manual readings were meant to own, and a mistyped id
-        is far more likely than an intentionally empty statistic.
-        """
-        if self._manual_until is not None:
-            return floor_from_date(self._manual_until, self.timezone)
-        statistic_id = self._manual_statistic_id
-        if statistic_id is None:
-            return None
-        rows = await get_instance(self.hass).async_add_executor_job(
-            get_last_statistics, self.hass, 1, statistic_id, True, {"sum"}
-        )
-        floor = floor_from_last_statistics(rows, statistic_id)
-        if floor is None:
-            raise UpdateFailed(
-                f"The manual statistic '{statistic_id}' has no data. Check the "
-                "id in the Origin Energy options (Developer tools > Statistics "
-                "lists the valid ids), or clear the option."
-            )
-        return floor
 
     async def _async_baseline_cursor(self, start: datetime) -> _ImportCursor | None:
         """Sums as of the last statistic strictly before `start`.
@@ -608,6 +562,80 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
         return _sum(self.consumption_statistic_id), _sum(self.cost_statistic_id)
 
     # ------------------------------------------------------------------
+    # Manual data
+    # ------------------------------------------------------------------
+
+    async def _async_prepare_manual_days(
+        self, start: datetime, end: datetime, cursor: _ImportCursor
+    ) -> None:
+        """Work out which days in `start`..`end` already have manual data.
+
+        Raises rather than carrying on when the manual statistic is configured
+        but holds nothing at all: a mistyped id is far more likely than an
+        intentionally empty statistic, and importing as if there were no
+        manual data would write over the days it was meant to protect.
+        """
+        statistic_id = self._manual_statistic_id
+        if statistic_id is None:
+            return
+        instance = get_instance(self.hass)
+        last = await instance.async_add_executor_job(
+            get_last_statistics, self.hass, 1, statistic_id, True, set()
+        )
+        if not last:
+            raise UpdateFailed(
+                f"The manual statistic '{statistic_id}' has no data. Check the "
+                "id in the Origin Energy options (Developer tools > Statistics "
+                "lists the valid ids), or clear the option."
+            )
+
+        first, last_instant = expand_to_local_days(start, end, self.timezone)
+        rows = await instance.async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            first,
+            last_instant,
+            {statistic_id},
+            "hour",
+            None,
+            {"change"},
+        )
+        cursor.skip_days = days_with_manual_data(
+            rows.get(statistic_id), self.timezone
+        )
+        cursor.skip_tz = self.timezone
+        if not cursor.skip_days:
+            return
+
+        _LOGGER.debug(
+            "Origin Energy: skipping %d day(s) with manual data in %s..%s",
+            len(cursor.skip_days),
+            start,
+            end,
+        )
+        own = await instance.async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            first,
+            last_instant,
+            {self.consumption_statistic_id, self.cost_statistic_id},
+            "hour",
+            None,
+            {"sum"},
+        )
+        cost_by_start = {
+            row["start"]: float(row["sum"])
+            for row in own.get(self.cost_statistic_id) or []
+        }
+        cursor.existing = {
+            dt_util.utc_from_timestamp(row["start"]): (
+                float(row["sum"]),
+                cost_by_start.get(row["start"], cursor.cost_sum),
+            )
+            for row in own.get(self.consumption_statistic_id) or []
+        }
+
+    # ------------------------------------------------------------------
     # Shared import machinery
     # ------------------------------------------------------------------
 
@@ -646,6 +674,7 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
         fill in progressively.
         """
         consumption_metadata, cost_metadata = self._statistic_metadata()
+        await self._async_prepare_manual_days(start, end, cursor)
         window = timedelta(days=chunk_days(self.time_unit))
         window_start = start
 
@@ -712,6 +741,16 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
             # Skips both the boundary point shared with the previous window
             # and anything already imported.
             if cursor.last_start is not None and start <= cursor.last_start:
+                continue
+
+            # Manual data wins for the whole day. If this series already has a
+            # row for the hour, the running sums carry on from it so the hours
+            # written after it stay continuous.
+            if cursor.skip_tz is not None and local_day(start, cursor.skip_tz) in cursor.skip_days:
+                kept = cursor.existing.get(start)
+                if kept is not None:
+                    cursor.consumption_sum, cursor.cost_sum = kept
+                cursor.skipped += 1
                 continue
 
             consumption_kwh = point["totalConsumedEnergy"] * energy_scale

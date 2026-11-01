@@ -23,7 +23,6 @@ from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.selector import (
     BooleanSelector,
-    DateSelector,
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
@@ -46,7 +45,6 @@ from .const import (
     AUTH_DOMAIN,
     CONF_AGREEMENT_ID,
     CONF_MANUAL_STATISTIC_ID,
-    CONF_MANUAL_UNTIL_DATE,
     CONF_RESET_STATISTICS,
     CONF_SESSION_COOKIE,
     CONF_TIME_UNIT,
@@ -58,7 +56,7 @@ from .const import (
     MAX_UPDATE_INTERVAL_HOURS,
     MIN_UPDATE_INTERVAL_HOURS,
 )
-from .manual_floor import parse_manual_until, parse_statistic_id
+from .manual_days import parse_statistic_id
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -229,7 +227,7 @@ class OriginEnergyOptionsFlow(OptionsFlow):
     which is a preference, not something the integration can derive.
 
     It also takes the id of a manual statistic: when set, Origin's data is
-    only added for hours after that statistic's last row (see manual_floor.py).
+    not added for any day on which that statistic has data (see manual_days.py).
     """
 
     async def async_step_init(
@@ -237,24 +235,18 @@ class OriginEnergyOptionsFlow(OptionsFlow):
     ) -> ConfigFlowResult:
         errors: dict[str, str] = {}
         current_manual = self.config_entry.options.get(CONF_MANUAL_STATISTIC_ID)
-        current_from = self.config_entry.options.get(CONF_MANUAL_UNTIL_DATE)
 
         if user_input is not None:
             current_manual = user_input.get(CONF_MANUAL_STATISTIC_ID)
-            current_from = user_input.get(CONF_MANUAL_UNTIL_DATE)
-            manual_id = manual_until = None
+            manual_id = None
             try:
                 manual_id = parse_statistic_id(current_manual)
             except ValueError:
                 errors[CONF_MANUAL_STATISTIC_ID] = "invalid_statistic_id"
-            try:
-                manual_until = parse_manual_until(current_from)
-            except ValueError:
-                errors[CONF_MANUAL_UNTIL_DATE] = "invalid_date"
             if not errors:
                 reset = bool(user_input.get(CONF_RESET_STATISTICS))
                 coordinator = getattr(self.config_entry, "runtime_data", None)
-                if reset and not (manual_id or manual_until):
+                if reset and not manual_id:
                     errors[CONF_RESET_STATISTICS] = "reset_needs_statistic"
                 elif reset and coordinator is None:
                     errors[CONF_RESET_STATISTICS] = "reset_not_loaded"
@@ -272,8 +264,6 @@ class OriginEnergyOptionsFlow(OptionsFlow):
                 # cleared.
                 if manual_id:
                     data[CONF_MANUAL_STATISTIC_ID] = manual_id
-                if manual_until:
-                    data[CONF_MANUAL_UNTIL_DATE] = manual_until
                 if reset:
                     # Saved first so the coordinator sees the new id, then
                     # the one-time clear runs. The tick-box itself is not
@@ -312,10 +302,6 @@ class OriginEnergyOptionsFlow(OptionsFlow):
                         CONF_MANUAL_STATISTIC_ID,
                         description={"suggested_value": current_manual},
                     ): TextSelector(),
-                    vol.Optional(
-                        CONF_MANUAL_UNTIL_DATE,
-                        description={"suggested_value": current_from},
-                    ): DateSelector(),
                     vol.Optional(CONF_RESET_STATISTICS, default=False): BooleanSelector(),
                 }
             ),

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Offline checks for the "Origin after manual data" behaviour.
+Offline checks for skipping days that already have manual data.
 
 Runs without Home Assistant installed: the HA/aiohttp modules are stubbed
 and the recorder is replaced by an in-memory statistics table, so the real
@@ -9,7 +9,7 @@ runs against a fake Origin API and a fake store. When Home Assistant *is*
 importable the stubs are skipped for the parts that need no recorder.
 
 Usage:
-    python tools/test_manual_floor_unit.py
+    python tools/test_manual_days_unit.py
 """
 import asyncio
 import sys
@@ -133,22 +133,18 @@ install_stubs()
 from origin_energy import coordinator as coord  # noqa: E402
 from origin_energy.api import UsageWindow  # noqa: E402
 from origin_energy.coordinator import OriginEnergyCoordinator, _ImportCursor  # noqa: E402
-from origin_energy.manual_floor import (  # noqa: E402
-    ManualFloor,
-    configured_manual_until,
+from origin_energy.manual_days import (  # noqa: E402
     configured_statistic_id,
-    floor_from_date,
-    parse_manual_until,
-    floor_from_last_statistics,
-    later_start,
-    not_before_floor,
+    days_with_manual_data,
+    expand_to_local_days,
+    local_day,
     parse_statistic_id,
 )
 
 # --------------------------------------------------------------------------
 # 1. The pure helpers
 # --------------------------------------------------------------------------
-print("manual_floor helpers")
+print("manual_days helpers")
 check("blank -> None", parse_statistic_id("   "), None)
 check("None -> None", parse_statistic_id(None), None)
 check("entity id accepted + lower-cased", parse_statistic_id(" Sensor.Electricity_Meter_Total "), "sensor.electricity_meter_total")
@@ -162,35 +158,28 @@ for bad in ("sensor", "sensor.", "a.b.c", "has space.x", "sensor.x-y"):
 check("stored garbage ignored, not raised", configured_statistic_id({"manual_statistic_id": "nope"}, "manual_statistic_id"), None)
 check("stored id read", configured_statistic_id({"manual_statistic_id": "sensor.m"}, "manual_statistic_id"), "sensor.m")
 
-floor = floor_from_last_statistics({"sensor.m": [{"start": hr(30, 9).timestamp(), "sum": 5.0}]}, "sensor.m")
-check("floor reads the last row's start", floor, ManualFloor(hr(30, 9)))
-check("first free hour is the next one", floor.first_free_start, hr(30, 10))
-check("no rows -> no floor", floor_from_last_statistics({"sensor.m": []}, "sensor.m"), None)
-check("missing id -> no floor", floor_from_last_statistics({}, "sensor.m"), None)
-check("not_before_floor pushes a start forward", not_before_floor(hr(25, 0), floor), hr(30, 10))
-check("not_before_floor leaves a later start", not_before_floor(hr(31, 0), floor), hr(31, 0))
-check("not_before_floor without a floor", not_before_floor(hr(25, 0), None), hr(25, 0))
-check("later_start: None + floor", later_start(None, floor), hr(30, 9))
-check("later_start: cursor already later", later_start(hr(31, 0), floor), hr(31, 0))
-check("later_start: floor later", later_start(hr(25, 0), floor), hr(30, 9))
-check("later_start: no floor keeps cursor", later_start(hr(25, 0), None), hr(25, 0))
 
-print("fixed start date helpers")
-check("blank date -> None", parse_manual_until("  "), None)
-check("date accepted", parse_manual_until("2026-10-31"), "2026-10-31")
-for bad in ("31/10/2026", "2026-13-01", "tomorrow"):
-    try:
-        parse_manual_until(bad)
-        check(f"bad date {bad!r} rejected", "accepted", "ValueError")
-    except ValueError:
-        check(f"bad date {bad!r} rejected", "ValueError", "ValueError")
-check("stored bad date ignored", configured_manual_until({"manual_until_date": "x"}, "manual_until_date"), None)
-check("UTC date: first free hour is midnight AFTER that day", floor_from_date("2026-10-30", timezone.utc).first_free_start, hr(31, 0))
+def row(moment, change):
+    return {"start": moment.timestamp(), "change": change}
+
+
+from datetime import date  # noqa: E402
+
+check("a change marks its day", days_with_manual_data([row(hr(22, 12), 5.0)], UTC), frozenset({date(2026, 10, 22)}))
+check("zero change does not (a live sensor ticking over)", days_with_manual_data([row(hr(22, h), 0.0) for h in range(24)], UTC), frozenset())
+check("rounding noise does not", days_with_manual_data([row(hr(22, 3), 1e-9)], UTC), frozenset())
+check("a negative change does", days_with_manual_data([row(hr(22, 3), -2.0)], UTC), frozenset({date(2026, 10, 22)}))
+check("a missing change is ignored", days_with_manual_data([{"start": hr(22, 3).timestamp(), "change": None}], UTC), frozenset())
+check("None rows", days_with_manual_data(None, UTC), frozenset())
+check("two entries on two days", days_with_manual_data([row(hr(22, 1), 1), row(hr(23, 9), 1), row(hr(23, 10), 1)], UTC), frozenset({date(2026, 10, 22), date(2026, 10, 23)}))
+check("local_day in UTC", local_day(hr(22, 23), UTC), date(2026, 10, 22))
+check("expand_to_local_days (UTC) covers whole days", expand_to_local_days(hr(22, 5), hr(24, 7), UTC), (hr(22, 0), hr(25, 0)))
 try:
     sydney = ZoneInfo("Australia/Sydney")
-    check("Sydney date: first free hour is the next local midnight (13:00Z, AEDT)", floor_from_date("2026-10-30", sydney).first_free_start, hr(30, 13))
-    check("Sydney before DST starts (+10)", floor_from_date("2026-10-02", sydney).first_free_start, datetime(2026, 10, 2, 14, tzinfo=UTC))
-    check("Sydney across the DST change (3 Oct 2026 is +10, 4 Oct +11)", floor_from_date("2026-10-03", sydney).first_free_start, datetime(2026, 10, 3, 14, tzinfo=UTC))
+    # 13:30Z on the 30th is 00:30 on the 31st in Sydney (AEDT, +11)
+    check("Sydney: an entry at 13:30Z belongs to the NEXT local day", days_with_manual_data([row(hr(30, 13) + timedelta(minutes=30), 3.0)], sydney), frozenset({date(2026, 10, 31)}))
+    check("Sydney: an entry at 12:30Z belongs to the same local day", days_with_manual_data([row(hr(30, 12) + timedelta(minutes=30), 3.0)], sydney), frozenset({date(2026, 10, 30)}))
+    check("expand_to_local_days (Sydney) widens to local midnights", expand_to_local_days(hr(30, 20), hr(31, 2), sydney), (hr(30, 13), hr(31, 13)))
 except Exception as err:  # no tz database on this machine
     print(f"  skip Sydney checks ({err.__class__.__name__}: install tzdata to run them)")
 
@@ -208,6 +197,7 @@ class Store:
     def __init__(self):
         self.rows = {}  # statistic_id -> {start: {"state":..,"sum":..}}
         self.writes = []  # (statistic_id, start) in order
+        self.cleared = []
 
     def put(self, statistic_id, start, state, total):
         self.rows.setdefault(statistic_id, {})[start] = {"state": state, "sum": total}
@@ -226,11 +216,16 @@ class Store:
     def statistics_during_period(self, hass, start, end, ids, period, units, types_):
         out = {}
         for sid in ids:
-            got = [
-                {"start": s.timestamp(), "sum": r["sum"]}
-                for s, r in sorted(self.rows.get(sid, {}).items())
-                if start <= s < end
-            ]
+            ordered = sorted(self.rows.get(sid, {}).items())
+            got = []
+            for i, (s, r) in enumerate(ordered):
+                if not (start <= s < end):
+                    continue
+                entry = {"start": s.timestamp(), "sum": r["sum"]}
+                if types_ and "change" in types_:
+                    # like HA: relative to the row before it (the first row ever is its own state)
+                    entry["change"] = r["sum"] - ordered[i - 1][1]["sum"] if i else r["state"]
+                got.append(entry)
             if got:
                 out[sid] = got
         return out
@@ -241,22 +236,19 @@ class Store:
             self.rows.pop(sid, None)
 
     def add_external(self, hass, metadata, stats):
-        for row in stats:
-            self.put(metadata["statistic_id"], row["start"], row["state"], row["sum"])
-            self.writes.append((metadata["statistic_id"], row["start"]))
+        for row_ in stats:
+            self.put(metadata["statistic_id"], row_["start"], row_["state"], row_["sum"])
+            self.writes.append((metadata["statistic_id"], row_["start"]))
 
 
 class FakeOrigin:
-    """Hourly data, 1 kWh-ish per hour, published up to last_reading."""
+    """Hourly data published up to last_published_hour."""
 
     def __init__(self, first, last_published_hour):
         self.first = first
         self.last = last_published_hour  # last hour that has data
         self.queries = []
-
-    @staticmethod
-    def wh(hour):
-        return (int(hour.timestamp() // 3600) % 7 + 1) * 100  # 100..700 Wh
+        self.wh = lambda hour: (int(hour.timestamp() // 3600) % 7 + 1) * 100  # 100..700 Wh
 
     async def async_get_usage(self, agreement, start, end, unit):
         self.queries.append((start, end))
@@ -283,8 +275,12 @@ class FakeOrigin:
         )
 
 
-def make(store, origin, manual_id=None, backfill_start=None):
-    store_ns = types.SimpleNamespace(
+async def _run_job(fn, *args):
+    return fn(*args)
+
+
+def make(store, origin, manual_id=None, tz=UTC):
+    ns = types.SimpleNamespace(
         get_instance=lambda hass: types.SimpleNamespace(
             async_add_executor_job=_run_job,
             async_clear_statistics=store.clear,
@@ -293,7 +289,7 @@ def make(store, origin, manual_id=None, backfill_start=None):
         statistics_during_period=store.statistics_during_period,
         async_add_external_statistics=store.add_external,
     )
-    for name, value in vars(store_ns).items():
+    for name, value in vars(ns).items():
         setattr(coord, name, value)
 
     c = object.__new__(OriginEnergyCoordinator)
@@ -302,12 +298,11 @@ def make(store, origin, manual_id=None, backfill_start=None):
     c.config_entry.data = {}
     c.config_entry.options = {"manual_statistic_id": manual_id} if manual_id else {}
     c.agreement_id = "111"
-    c.timezone = ZoneInfo("UTC")
+    c.timezone = tz
     c.time_unit = "HOURLY"
     c.consumption_statistic_id = OWN
     c.cost_statistic_id = OWN_COST
     c._manual_statistic_id = manual_id
-    c._manual_until = None
     c._backfill_task = None
     c._import_lock = asyncio.Lock()
     c.backfill_started = 0
@@ -317,7 +312,7 @@ def make(store, origin, manual_id=None, backfill_start=None):
         return origin
 
     async def _history_start():
-        return backfill_start or origin.first
+        return origin.first
 
     c._async_api = _api
     c._async_history_start = _history_start
@@ -325,16 +320,15 @@ def make(store, origin, manual_id=None, backfill_start=None):
     return c
 
 
-async def _run_job(fn, *args):
-    return fn(*args)
-
-
-def put_manual(store, first, last, base=1000.0):
-    """Hand-entered hourly rows with a running sum, 0.5 kWh per hour."""
+def manual_series(store, first, last, entries=None, base=1000.0):
+    """A live sensor: a row every hour from first..last. `entries` maps an hour
+    to the kWh entered then; every other hour changes by zero."""
+    entries = entries or {}
     h, total = first, base
     while h <= last:
-        total += 0.5
-        store.put(MANUAL, h, 0.5, total)
+        amount = entries.get(h, 0.0)
+        total += amount
+        store.put(MANUAL, h, amount, total)
         h += timedelta(hours=1)
 
 
@@ -346,92 +340,98 @@ def hours(first, last):
     return out
 
 
+def day_hours(*days):
+    return [h for d in days for h in hours(hr(d, 0), hr(d, 23))]
+
+
 def run(coro):
     return asyncio.run(coro)
 
 
-# ---- A: manual data already covers everything Origin has --------------------
-print("A. manual covers all of Origin's data")
-store = Store()
-put_manual(store, hr(20, 0), hr(30, 9))
-before = store.snapshot(MANUAL)
-origin = FakeOrigin(hr(20, 0), hr(29, 23))
-c = make(store, origin, MANUAL)
-run(c._async_backfill())
-check("nothing written to Origin's series", store.snapshot(OWN), {})
-check("manual rows untouched", store.snapshot(MANUAL), before)
-check("no write ever targeted the manual statistic", [w for w in store.writes if w[0] == MANUAL], [])
-check("backfill still marks complete", c.config_entry.__class__ is not None and c.hass.config_entries.async_update_entry.called, True)
+def chained(rows, hours_list, origin_wh):
+    """Every listed hour's sum rose by exactly that hour's own value over the row before it."""
+    ordered = sorted(rows)
+    ok = True
+    for h in hours_list:
+        i = ordered.index(h)
+        if i == 0:
+            continue
+        ok &= abs(rows[h]["sum"] - rows[ordered[i - 1]]["sum"] - origin_wh(h) / 1000) < 1e-9
+    return ok
 
-# ---- B: Origin is ahead of the manual data: only later hours are added ------
-print("B. Origin ahead of manual: backfill adds only later hours")
+
+# ---- A: entries on three days; everything else imports ----------------------
+print("A. days with a manual entry are skipped, every other day is added")
 store = Store()
-put_manual(store, hr(20, 0), hr(28, 23))
+manual_series(store, hr(20, 0), hr(30, 9), {hr(22, 12): 21.5, hr(23, 9): 18.0, hr(27, 20): 25.0})
 before = store.snapshot(MANUAL)
 origin = FakeOrigin(hr(20, 0), hr(29, 23))
 c = make(store, origin, MANUAL)
 run(c._async_backfill())
 own = store.snapshot(OWN)
-want_hours = hours(hr(29, 0), hr(29, 23))
-check("only the hours after the last manual hour", sorted(own), want_hours)
+check("exactly the days without a manual entry", sorted(own), day_hours(20, 21, 24, 25, 26, 28, 29))
 check("manual rows untouched", store.snapshot(MANUAL), before)
-total = 0.0
-sums_ok = True
-for h in want_hours:
-    total += FakeOrigin.wh(h) / 1000
-    sums_ok &= abs(own[h]["sum"] - total) < 1e-9
-check("Origin's running sum accumulates from the first added hour", sums_ok, True)
-check("API was asked only from the first free hour", min(q[0] for q in origin.queries) >= hr(29, 0), True)
+check("no write ever targeted the manual statistic", [w for w in store.writes if w[0] == MANUAL], [])
+check("sums only count hours that were written", chained(own, sorted(own)[1:], origin.wh), True)
+check("backfill marked complete", c.hass.config_entries.async_update_entry.called, True)
 
-# ---- C: next poll after Origin publishes another day -----------------------
-print("C. next poll appends further hours, never rewrites manual or earlier rows")
-origin.last = hr(30, 5)  # Origin publishes into today
+# ---- B: a live sensor with no entries blocks nothing -------------------------
+print("B. a live sensor with no entries does not block Origin's days")
+store = Store()
+manual_series(store, hr(20, 0), hr(30, 9))  # every hour, zero change
+origin = FakeOrigin(hr(20, 0), hr(29, 23))
+c = make(store, origin, MANUAL)
+run(c._async_backfill())
+check("all days imported", sorted(store.snapshot(OWN)), day_hours(20, 21, 22, 23, 24, 25, 26, 27, 28, 29))
+
+# ---- C: later polls --------------------------------------------------------
+print("C. the next poll adds new days and does not touch skipped ones")
+store = Store()
+manual_series(store, hr(20, 0), hr(30, 9), {hr(22, 12): 21.5, hr(27, 20): 25.0})
+origin = FakeOrigin(hr(20, 0), hr(29, 23))
+c = make(store, origin, MANUAL)
+run(c._async_backfill())
+origin.last = hr(30, 5)
 store.writes.clear()
 run(c._async_import_recent())
-own2 = store.snapshot(OWN)
-check("new hours appended", sorted(own2), hours(hr(29, 0), hr(30, 5)))
-check("manual still untouched", store.snapshot(MANUAL), before)
-check("no write targeted the manual statistic", [w for w in store.writes if w[0] == MANUAL], [])
-check("no row at or before the manual floor was written", [w for w in store.writes if w[1] <= hr(28, 23)], [])
-total = 0.0
-ok = True
-for h in sorted(own2):
-    total += FakeOrigin.wh(h) / 1000
-    ok &= abs(own2[h]["sum"] - total) < 1e-9
-check("sums stay continuous across the join", ok, True)
+own = store.snapshot(OWN)
+check("the new hours of day 30 were added", [h for h in own if h >= hr(30, 0)], hours(hr(30, 0), hr(30, 5)))
+check("nothing was written for the skipped days", [w for w in store.writes if w[1].day in (22, 27)], [])
+check("sums stay continuous", chained(own, [h for h in sorted(own)[1:]], origin.wh), True)
 
-# ---- D: Origin's series already has old rows covering manual hours ----------
-print("D. option added after Origin's series already existed")
+# ---- D: the series already has rows on a day that now has a manual entry -------
+print("D. option set after Origin's series already existed")
 store = Store()
 origin = FakeOrigin(hr(20, 0), hr(29, 23))
 c0 = make(store, origin, None)
-run(c0._async_backfill())  # old behaviour: everything
+run(c0._async_backfill())
 old = store.snapshot(OWN)
-check("setup: old series covers every hour", sorted(old), hours(hr(20, 0), hr(29, 23)))
-put_manual(store, hr(20, 0), hr(27, 23))
-manual_before = store.snapshot(MANUAL)
-# Origin revises the last days: change every value
-origin.wh = staticmethod(lambda h: (int(h.timestamp() // 3600) % 5 + 1) * 100)
+manual_series(store, hr(20, 0), hr(30, 9), {hr(27, 12): 25.0})
+origin.wh = lambda h: (int(h.timestamp() // 3600) % 5 + 1) * 100  # Origin revised every value
 store.writes.clear()
 c = make(store, origin, MANUAL)
 run(c._async_import_recent())
 new = store.snapshot(OWN)
-check("rows at or before the manual floor are exactly as they were",
-      {h: r for h, r in new.items() if h <= hr(27, 23)}, {h: r for h, r in old.items() if h <= hr(27, 23)})
-check("nothing written at or before the floor", [w for w in store.writes if w[1] <= hr(27, 23)], [])
-check("hours after the floor were refreshed", any(w[1] > hr(27, 23) for w in store.writes), True)
-base_sum = old[hr(27, 23)]["sum"]
-total = base_sum
-ok = True
-for h in hours(hr(28, 0), hr(29, 23)):
-    if h in new and h >= hr(28, 0):
-        total += origin.wh(h) / 1000
-        ok &= abs(new[h]["sum"] - total) < 1e-9
-check("sums continue from the series' own sum at the floor", ok, True)
-check("manual untouched", store.snapshot(MANUAL), manual_before)
+check("the skipped day's rows are exactly as they were", {h: r for h, r in new.items() if h.day == 27}, {h: r for h, r in old.items() if h.day == 27})
+check("nothing was written for the skipped day", [w for w in store.writes if w[1].day == 27], [])
+check("other days in the overlap window were refreshed", any(w[1].day in (25, 26, 28, 29) for w in store.writes), True)
+after_skip = [h for h in hours(hr(28, 0), hr(29, 23))]
+check("rows after the skipped day continue from its sum", chained(new, after_skip, origin.wh), True)
 
-# ---- E: configured but the statistic has no data -> refuse -------------------
-print("E. manual statistic id with no data")
+# ---- E: everything covered by manual data ----------------------------------
+print("E. every day already has manual data")
+store = Store()
+manual_series(store, hr(20, 0), hr(30, 9), {hr(d, 12): 20.0 for d in range(20, 31)})
+origin = FakeOrigin(hr(20, 0), hr(29, 23))
+c = make(store, origin, MANUAL)
+run(c._async_backfill())
+check("nothing written", store.snapshot(OWN), {})
+run(c._async_import_recent())
+check("a later poll writes nothing either", store.snapshot(OWN), {})
+check("and does not re-run the whole backfill every poll", c.backfill_started, 0)
+
+# ---- F: mistyped id -------------------------------------------------------------
+print("F. manual statistic id with no data")
 store = Store()
 origin = FakeOrigin(hr(20, 0), hr(29, 23))
 c = make(store, origin, "sensor.typo")
@@ -442,37 +442,26 @@ except UpdateFailed as err:
     check("raises UpdateFailed naming the id", "sensor.typo" in str(err), True)
 check("nothing was written", store.writes, [])
 
-# ---- F: no option: behaviour as before (overlap rewrite) ----------------------
-print("F. without the option the overlap still rewrites trailing days")
+# ---- G: no option: unchanged behaviour --------------------------------------------
+print("G. without a manual statistic everything imports and the overlap still rewrites")
 store = Store()
 origin = FakeOrigin(hr(20, 0), hr(29, 23))
 c = make(store, origin, None)
 run(c._async_backfill())
+check("all days", sorted(store.snapshot(OWN)), day_hours(20, 21, 22, 23, 24, 25, 26, 27, 28, 29))
 store.writes.clear()
 run(c._async_import_recent())
 check("revision overlap rewrote earlier hours", min(w[1] for w in store.writes if w[0] == OWN) < hr(29, 0), True)
 
-# ---- G: floor ahead of Origin's data: early out, no baseline lookups ----------
-print("G. recent update when Origin has not reached the manual data")
+# ---- H: the one-time clear -----------------------------------------------------------
+print("H. clear Origin's statistics, then re-import skipping manual days")
 store = Store()
 origin = FakeOrigin(hr(20, 0), hr(29, 23))
 c0 = make(store, origin, None)
 run(c0._async_backfill())
-put_manual(store, hr(20, 0), hr(30, 9))
-store.writes.clear()
-c = make(store, origin, MANUAL)
-run(c._async_import_recent())
-check("nothing written", store.writes, [])
-
-# ---- H: option change is noticed ------------------------------------------------
-print("I. clear Origin's overlapping history, then re-import after the manual data")
-store = Store()
-origin = FakeOrigin(hr(20, 0), hr(29, 23))
-c0 = make(store, origin, None)
-run(c0._async_backfill())
-put_manual(store, hr(20, 0), hr(28, 23))
+manual_series(store, hr(20, 0), hr(30, 9), {hr(22, 12): 21.5, hr(23, 9): 18.0})
 manual_before = store.snapshot(MANUAL)
-check("setup: Origin's series double covers the manual days", hr(25, 0) in store.snapshot(OWN), True)
+check("setup: Origin's series covers the manual days", hr(22, 5) in store.snapshot(OWN), True)
 c = make(store, origin, None)
 c.config_entry.data = {"backfill_complete": True}
 c.config_entry.options = {"manual_statistic_id": MANUAL}
@@ -482,47 +471,37 @@ check("Origin's series is empty", store.snapshot(OWN), {})
 check("manual untouched", store.snapshot(MANUAL), manual_before)
 check("backfill flag turned off", c.hass.config_entries.async_update_entry.call_args.kwargs["data"]["backfill_complete"], False)
 run(c._async_backfill())
-own = store.snapshot(OWN)
-check("re-import adds only hours after the manual data", sorted(own), hours(hr(29, 0), hr(29, 23)))
-check("manual still untouched", store.snapshot(MANUAL), manual_before)
+check("re-import skips exactly the manual days", sorted(store.snapshot(OWN)), day_hours(20, 21, 24, 25, 26, 27, 28, 29))
+for bad_id, why in ((OWN, "Origin's own id"), (None, "no id")):
+    try:
+        bad = make(Store(), origin, None)
+        bad.config_entry.options = {"manual_statistic_id": bad_id} if bad_id else {}
+        run(bad.async_reset_for_manual_statistic())
+        check(f"reset refused with {why}", "accepted", "ValueError")
+    except ValueError:
+        check(f"reset refused with {why}", "ValueError", "ValueError")
+
+# ---- I: local days in a non-UTC zone ---------------------------------------------------
+print("I. 'a day' is the local day")
 try:
-    bad = make(Store(), origin, None)
-    bad.config_entry.options = {"manual_statistic_id": OWN}
-    run(bad.async_reset_for_manual_statistic())
-    check("manual id equal to Origin's own id is refused", "accepted", "ValueError")
-except ValueError:
-    check("manual id equal to Origin's own id is refused", "ValueError", "ValueError")
+    sydney = ZoneInfo("Australia/Sydney")
+    store = Store()
+    # local day 31 Oct (AEDT +11) = 13:00Z on the 30th to 12:00Z on the 31st
+    manual_series(store, hr(28, 0), hr(31, 20), {hr(30, 20): 22.0})  # 20:00Z = 07:00 on the 31st, local
+    origin = FakeOrigin(hr(28, 0), hr(31, 20))
+    _FakeDt.NOW = datetime(2026, 11, 1, 10, 0, tzinfo=UTC)
+    c = make(store, origin, MANUAL, tz=sydney)
+    run(c._async_backfill())
+    own = store.snapshot(OWN)
+    local_days_written = {h.astimezone(sydney).date() for h in own}
+    check("the local day with the entry is skipped", date(2026, 10, 31) in local_days_written, False)
+    check("neighbouring local days are imported", {date(2026, 10, 29), date(2026, 10, 30)} <= local_days_written, True)
+    _FakeDt.NOW = datetime(2026, 10, 30, 10, 0, tzinfo=UTC)
+except Exception as err:  # no tz database on this machine
+    print(f"  skip ({err.__class__.__name__}: install tzdata to run this)")
 
-print("J. live manual statistic: a fixed date (manual covers up to and including it) wins over its last row")
-_FakeDt.NOW = datetime(2026, 11, 1, 10, 0, tzinfo=UTC)  # a day after Origin's newest hour
-store = Store()
-put_manual(store, hr(20, 0), hr(31, 20))  # keeps growing: last row is 'now'
-manual_before = store.snapshot(MANUAL)
-origin = FakeOrigin(hr(20, 0), hr(31, 23))
-c = make(store, origin, MANUAL)
-c.config_entry.options = {"manual_statistic_id": MANUAL, "manual_until_date": "2026-10-30"}
-c._manual_until = "2026-10-30"
-run(c._async_backfill())
-own = store.snapshot(OWN)
-check("hours from the start date are imported although the manual statistic runs past them", sorted(own), hours(hr(31, 0), hr(31, 23)))
-check("manual untouched", store.snapshot(MANUAL), manual_before)
-check("sums start from Origin's first imported hour", abs(own[hr(31, 0)]["sum"] - FakeOrigin.wh(hr(31, 0)) / 1000) < 1e-9, True)
-origin.last = hr(31, 23)
-c2 = make(store, origin, MANUAL)
-c2._manual_until = "2026-10-30"
-store.writes.clear()
-run(c2._async_import_recent())
-check("later polls never write before the start date", [w for w in store.writes if w[1] < hr(31, 0)], [])
-
-_FakeDt.NOW = datetime(2026, 10, 30, 10, 0, tzinfo=UTC)
-print("K. changing the start date is noticed")
-c = make(Store(), FakeOrigin(hr(20, 0), hr(29, 23)), None)
-check("unchanged -> False", c.async_adopt_manual_statistic(), False)
-c.config_entry.options = {"manual_until_date": "2026-10-31"}
-check("date set -> True", c.async_adopt_manual_statistic(), True)
-check("then stable -> False", c.async_adopt_manual_statistic(), False)
-
-print("H. adopting a changed option")
+# ---- J: option change is noticed -------------------------------------------------------
+print("J. adopting a changed option")
 c = make(Store(), FakeOrigin(hr(20, 0), hr(29, 23)), None)
 check("no change -> False", c.async_adopt_manual_statistic(), False)
 c.config_entry.options = {"manual_statistic_id": "sensor.electricity_meter_total"}

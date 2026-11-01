@@ -146,42 +146,38 @@ means the backfill hasn't written anything yet. Check
 **Developer tools → Statistics** and filter for `origin_energy` — if
 nothing is there, see [Troubleshooting](#troubleshooting).
 
-### Adding Origin's data after hand-entered readings
+### Not doubling up days you entered by hand
 
-If you already have a statistic holding manually entered readings for the
-same meter (for example `sensor.electricity_meter_total`), set it under
-**Settings → Devices & services → Origin Energy → Configure → Manual
-statistic**. Find the exact id in **Developer tools → Statistics**.
+If you keep a statistic of manually entered readings for the same meter (for
+example `sensor.electricity_meter_total`), set it under **Settings → Devices
+& services → Origin Energy → Configure → Manual statistic**. Find the exact
+id in **Developer tools → Statistics**.
 
-Origin's hours up to and including that statistic's last row are then
-skipped, and only later hours are added, so nothing is counted twice and
-your manual values are never changed (the statistic is only read, never
-written). Origin's series carries on from its own running total.
+The rule is applied one local day at a time:
 
-- **If your statistic keeps recording by itself** (a live sensor writes a row
-  every hour, so its "last value" is always now), Origin's hours would
-  always be skipped. Set **Manual data covers up to and including this date**
-  instead, to the last day you entered readings for. Nothing from Origin is
-  added for that day or earlier, and Origin's data from the following
-  local midnight onwards is imported. The date is used in place of the
-  statistic's last value.
+- **A day on which that statistic recorded usage** (a non-zero change): nothing
+  from Origin is added for that day.
+- **Every other day** (before your manual data, after it, or a gap between
+  manual days): Origin's data is added as normal.
+
+Your statistic is only ever read, never written. Origin's data for a manual
+day may still be downloaded, but it is not added to the statistics.
+
+- A sensor that keeps recording by itself has a row for every hour, but on
+  days nobody entered anything those rows carry no change, so those days still
+  get Origin's data.
 - Add **both** statistics as grid consumption sources in the Energy
-  dashboard: yours covers the manual period, Origin's covers what follows.
-- Origin publishes a day late, so nothing is added until it has data for
-  hours after your last manual row.
-- The last manual hour is re-read on every update. If your statistic keeps
-  growing (a live sensor, or more manual rows later), Origin's cut-off
-  moves with it. Hours Origin has already written stay as they are; use
-  **Developer tools → Statistics** to remove any that now overlap.
-- **Already seeing it counted twice?** If Origin's series was imported before
-  you set this option, its older hours still overlap your manual ones. In
-  the same Configure dialog tick **Clear Origin's imported data now…** and
-  submit. That deletes Origin's two statistics (never yours) and re-imports
-  only hours after your manual statistic's last value. Origin hours before
-  that are not brought back, so your manual statistic must cover that
-  period. It resets to off afterwards.
+  dashboard.
+- Origin publishes about a day late, so the newest day appears the day after.
+- The check runs on every update. If you add manual data for a day that
+  Origin already filled in, that day is counted twice until you tick the
+  box below.
+- **Already seeing days counted twice?** In the same Configure dialog tick
+  **Clear Origin's imported data now…** and submit. That deletes Origin's two
+  statistics (never yours) and re-imports everything from Origin except days
+  on which your statistic has data. It resets to off afterwards.
 - A mistyped id stops the import with an error in the log rather than
-  writing over your manual hours. Clear the field to go back to importing
+  writing over your manual days. Clear the field to go back to importing
   everything.
 
 ## Limitations
@@ -231,7 +227,7 @@ logger:
 ```bash
 python3 tools/test_api_unit.py         # agreement selection, retries, request shape
 python3 tools/test_statistics_unit.py  # sums, units, de-duplication, DST fold
-python3 tools/test_manual_floor_unit.py # manual-statistic cut-off; needs no Home Assistant
+python3 tools/test_manual_days_unit.py  # manual-day skipping; needs no Home Assistant
 ```
 
 The first two run offline against a faked session, but import Home Assistant, so

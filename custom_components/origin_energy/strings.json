@@ -35,21 +35,18 @@
         "data": {
           "update_interval_hours": "Update interval (hours)",
           "manual_statistic_id": "Manual statistic (optional)",
-          "manual_until_date": "Manual data covers up to and including this date (optional)",
-          "reset_origin_statistics": "Clear Origin's imported data now and re-import after the manual data (one time)"
+          "reset_origin_statistics": "Clear Origin's imported data now and re-import, skipping manual days (one time)"
         },
         "data_description": {
           "update_interval_hours": "How often to check Origin for new usage data. Default is 4 hours; 24 restores the original once-a-day behaviour.",
-          "manual_statistic_id": "The id of a statistic that already holds hand-entered readings for this meter, e.g. sensor.electricity_meter_total (see Developer tools > Statistics). Origin's hours up to that statistic's last value are skipped, so only later hours are added. It is only read, never changed. Leave blank to import everything.",
-          "manual_until_date": "The last day your manual readings cover. Nothing from Origin is added for that day or earlier; Origin's data is added from the day after. Use this when your manual statistic keeps recording by itself (a live sensor adds a row every hour), because its 'last value' is then always now and Origin would never be added. When set, it is used instead of the manual statistic's last value. Leave blank to follow the statistic.",
-          "reset_origin_statistics": "Use this if Origin's data and your manual data both show for the same days (double counted). It deletes Origin Energy's imported consumption and cost statistics, then re-imports only the hours after your manual statistic's last value. Origin data for earlier hours is not brought back. Your manual statistic is never touched. It resets to off afterwards."
+          "manual_statistic_id": "The id of a statistic that holds your hand-entered readings for this meter, e.g. sensor.electricity_meter_total (see Developer tools > Statistics). For any day on which it recorded usage, nothing from Origin is added; every other day is added from Origin as normal. It is only read, never changed. Leave blank to import everything.",
+          "reset_origin_statistics": "Use this if Origin's data and your manual data both show for the same days (double counted). It deletes Origin Energy's imported consumption and cost statistics, then re-imports everything from Origin except days on which your manual statistic has data. Your manual statistic is never touched. It resets to off afterwards."
         }
       }
     },
     "error": {
       "invalid_statistic_id": "That is not a statistic id. Use an entity id such as sensor.electricity_meter_total, or leave it blank.",
-      "invalid_date": "Enter a date, or leave it blank.",
-      "reset_needs_statistic": "Enter a manual statistic or a manual-data date first. Clearing without one would just re-import everything.",
+      "reset_needs_statistic": "Enter the manual statistic first. Clearing without one would just re-import everything.",
       "reset_not_loaded": "The integration is not running. Reload it, then try again.",
       "reset_timed_out": "Home Assistant did not finish clearing the statistics in time. Try again in a minute."
     }
