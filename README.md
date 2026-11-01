@@ -160,10 +160,11 @@ written). Origin's series carries on from its own running total.
 
 - **If your statistic keeps recording by itself** (a live sensor writes a row
   every hour, so its "last value" is always now), Origin's hours would
-  always be skipped. Set **Use Origin's data from this date** instead, for
-  example the day after your last hand-entered reading. That date is used
-  in place of the statistic's last value, and Origin's data from local
-  midnight on that date onwards is imported.
+  always be skipped. Set **Manual data covers up to and including this date**
+  instead, to the last day you entered readings for. Nothing from Origin is
+  added for that day or earlier, and Origin's data from the following
+  local midnight onwards is imported. The date is used in place of the
+  statistic's last value.
 - Add **both** statistics as grid consumption sources in the Energy
   dashboard: yours covers the manual period, Origin's covers what follows.
 - Origin publishes a day late, so nothing is added until it has data for

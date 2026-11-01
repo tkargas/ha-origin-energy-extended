@@ -58,7 +58,7 @@ from .const import (
     CONF_AGREEMENT_ID,
     CONF_BACKFILL_COMPLETE,
     CONF_MANUAL_STATISTIC_ID,
-    CONF_ORIGIN_FROM_DATE,
+    CONF_MANUAL_UNTIL_DATE,
     CONF_SESSION_COOKIE,
     CONF_TIME_UNIT,
     CONF_TIMEZONE,
@@ -73,7 +73,7 @@ from .const import (
 )
 from .manual_floor import (
     ManualFloor,
-    configured_origin_from,
+    configured_manual_until,
     configured_statistic_id,
     floor_from_date,
     floor_from_last_statistics,
@@ -189,8 +189,8 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
         self._manual_statistic_id = configured_statistic_id(
             config_entry.options, CONF_MANUAL_STATISTIC_ID
         )
-        self._origin_from = configured_origin_from(
-            config_entry.options, CONF_ORIGIN_FROM_DATE
+        self._manual_until = configured_manual_until(
+            config_entry.options, CONF_MANUAL_UNTIL_DATE
         )
         self._backfill_task: asyncio.Task[None] | None = None
         # Guards the statistics import so a background backfill and a
@@ -228,23 +228,23 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
         statistic_id = configured_statistic_id(
             self.config_entry.options, CONF_MANUAL_STATISTIC_ID
         )
-        origin_from = configured_origin_from(
-            self.config_entry.options, CONF_ORIGIN_FROM_DATE
+        manual_until = configured_manual_until(
+            self.config_entry.options, CONF_MANUAL_UNTIL_DATE
         )
         if (
             statistic_id == self._manual_statistic_id
-            and origin_from == self._origin_from
+            and manual_until == self._manual_until
         ):
             return False
         _LOGGER.debug(
             "Origin Energy manual cut-off changed from %s/%s to %s/%s",
             self._manual_statistic_id,
-            self._origin_from,
+            self._manual_until,
             statistic_id,
-            origin_from,
+            manual_until,
         )
         self._manual_statistic_id = statistic_id
-        self._origin_from = origin_from
+        self._manual_until = manual_until
         return True
 
     async def async_reset_for_manual_statistic(self) -> None:
@@ -261,7 +261,7 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
         self.async_adopt_manual_statistic()
         if self._manual_statistic_id in own_ids:
             raise ValueError("The manual statistic cannot be Origin's own statistic")
-        if self._manual_statistic_id is None and self._origin_from is None:
+        if self._manual_statistic_id is None and self._manual_until is None:
             raise ValueError("Set a manual statistic or a start date first")
 
         if self._backfill_task is not None:
@@ -542,8 +542,8 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
         very hours the manual readings were meant to own, and a mistyped id
         is far more likely than an intentionally empty statistic.
         """
-        if self._origin_from is not None:
-            return floor_from_date(self._origin_from, self.timezone)
+        if self._manual_until is not None:
+            return floor_from_date(self._manual_until, self.timezone)
         statistic_id = self._manual_statistic_id
         if statistic_id is None:
             return None

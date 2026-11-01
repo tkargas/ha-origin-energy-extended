@@ -135,10 +135,10 @@ from origin_energy.api import UsageWindow  # noqa: E402
 from origin_energy.coordinator import OriginEnergyCoordinator, _ImportCursor  # noqa: E402
 from origin_energy.manual_floor import (  # noqa: E402
     ManualFloor,
-    configured_origin_from,
+    configured_manual_until,
     configured_statistic_id,
     floor_from_date,
-    parse_origin_from,
+    parse_manual_until,
     floor_from_last_statistics,
     later_start,
     not_before_floor,
@@ -176,20 +176,21 @@ check("later_start: floor later", later_start(hr(25, 0), floor), hr(30, 9))
 check("later_start: no floor keeps cursor", later_start(hr(25, 0), None), hr(25, 0))
 
 print("fixed start date helpers")
-check("blank date -> None", parse_origin_from("  "), None)
-check("date accepted", parse_origin_from("2026-10-31"), "2026-10-31")
+check("blank date -> None", parse_manual_until("  "), None)
+check("date accepted", parse_manual_until("2026-10-31"), "2026-10-31")
 for bad in ("31/10/2026", "2026-13-01", "tomorrow"):
     try:
-        parse_origin_from(bad)
+        parse_manual_until(bad)
         check(f"bad date {bad!r} rejected", "accepted", "ValueError")
     except ValueError:
         check(f"bad date {bad!r} rejected", "ValueError", "ValueError")
-check("stored bad date ignored", configured_origin_from({"origin_from_date": "x"}, "origin_from_date"), None)
-check("UTC date: first free hour is midnight", floor_from_date("2026-10-31", timezone.utc).first_free_start, hr(31, 0))
+check("stored bad date ignored", configured_manual_until({"manual_until_date": "x"}, "manual_until_date"), None)
+check("UTC date: first free hour is midnight AFTER that day", floor_from_date("2026-10-30", timezone.utc).first_free_start, hr(31, 0))
 try:
     sydney = ZoneInfo("Australia/Sydney")
-    check("Sydney date: first free hour is local midnight (13:00Z, AEDT)", floor_from_date("2026-10-31", sydney).first_free_start, hr(30, 13))
-    check("Sydney before DST starts (+10)", floor_from_date("2026-10-03", sydney).first_free_start, datetime(2026, 10, 2, 14, tzinfo=UTC))
+    check("Sydney date: first free hour is the next local midnight (13:00Z, AEDT)", floor_from_date("2026-10-30", sydney).first_free_start, hr(30, 13))
+    check("Sydney before DST starts (+10)", floor_from_date("2026-10-02", sydney).first_free_start, datetime(2026, 10, 2, 14, tzinfo=UTC))
+    check("Sydney across the DST change (3 Oct 2026 is +10, 4 Oct +11)", floor_from_date("2026-10-03", sydney).first_free_start, datetime(2026, 10, 3, 14, tzinfo=UTC))
 except Exception as err:  # no tz database on this machine
     print(f"  skip Sydney checks ({err.__class__.__name__}: install tzdata to run them)")
 
@@ -306,7 +307,7 @@ def make(store, origin, manual_id=None, backfill_start=None):
     c.consumption_statistic_id = OWN
     c.cost_statistic_id = OWN_COST
     c._manual_statistic_id = manual_id
-    c._origin_from = None
+    c._manual_until = None
     c._backfill_task = None
     c._import_lock = asyncio.Lock()
     c.backfill_started = 0
@@ -492,15 +493,15 @@ try:
 except ValueError:
     check("manual id equal to Origin's own id is refused", "ValueError", "ValueError")
 
-print("J. live manual statistic: a fixed start date wins over its last row")
+print("J. live manual statistic: a fixed date (manual covers up to and including it) wins over its last row")
 _FakeDt.NOW = datetime(2026, 11, 1, 10, 0, tzinfo=UTC)  # a day after Origin's newest hour
 store = Store()
 put_manual(store, hr(20, 0), hr(31, 20))  # keeps growing: last row is 'now'
 manual_before = store.snapshot(MANUAL)
 origin = FakeOrigin(hr(20, 0), hr(31, 23))
 c = make(store, origin, MANUAL)
-c.config_entry.options = {"manual_statistic_id": MANUAL, "origin_from_date": "2026-10-31"}
-c._origin_from = "2026-10-31"
+c.config_entry.options = {"manual_statistic_id": MANUAL, "manual_until_date": "2026-10-30"}
+c._manual_until = "2026-10-30"
 run(c._async_backfill())
 own = store.snapshot(OWN)
 check("hours from the start date are imported although the manual statistic runs past them", sorted(own), hours(hr(31, 0), hr(31, 23)))
@@ -508,7 +509,7 @@ check("manual untouched", store.snapshot(MANUAL), manual_before)
 check("sums start from Origin's first imported hour", abs(own[hr(31, 0)]["sum"] - FakeOrigin.wh(hr(31, 0)) / 1000) < 1e-9, True)
 origin.last = hr(31, 23)
 c2 = make(store, origin, MANUAL)
-c2._origin_from = "2026-10-31"
+c2._manual_until = "2026-10-30"
 store.writes.clear()
 run(c2._async_import_recent())
 check("later polls never write before the start date", [w for w in store.writes if w[1] < hr(31, 0)], [])
@@ -517,7 +518,7 @@ _FakeDt.NOW = datetime(2026, 10, 30, 10, 0, tzinfo=UTC)
 print("K. changing the start date is noticed")
 c = make(Store(), FakeOrigin(hr(20, 0), hr(29, 23)), None)
 check("unchanged -> False", c.async_adopt_manual_statistic(), False)
-c.config_entry.options = {"origin_from_date": "2026-10-31"}
+c.config_entry.options = {"manual_until_date": "2026-10-31"}
 check("date set -> True", c.async_adopt_manual_statistic(), True)
 check("then stable -> False", c.async_adopt_manual_statistic(), False)
 
