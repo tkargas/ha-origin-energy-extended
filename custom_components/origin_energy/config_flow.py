@@ -23,6 +23,7 @@ from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.selector import (
     BooleanSelector,
+    DateSelector,
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
@@ -45,6 +46,7 @@ from .const import (
     AUTH_DOMAIN,
     CONF_AGREEMENT_ID,
     CONF_MANUAL_STATISTIC_ID,
+    CONF_ORIGIN_FROM_DATE,
     CONF_RESET_STATISTICS,
     CONF_SESSION_COOKIE,
     CONF_TIME_UNIT,
@@ -56,7 +58,7 @@ from .const import (
     MAX_UPDATE_INTERVAL_HOURS,
     MIN_UPDATE_INTERVAL_HOURS,
 )
-from .manual_floor import parse_statistic_id
+from .manual_floor import parse_origin_from, parse_statistic_id
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -235,17 +237,24 @@ class OriginEnergyOptionsFlow(OptionsFlow):
     ) -> ConfigFlowResult:
         errors: dict[str, str] = {}
         current_manual = self.config_entry.options.get(CONF_MANUAL_STATISTIC_ID)
+        current_from = self.config_entry.options.get(CONF_ORIGIN_FROM_DATE)
 
         if user_input is not None:
             current_manual = user_input.get(CONF_MANUAL_STATISTIC_ID)
+            current_from = user_input.get(CONF_ORIGIN_FROM_DATE)
+            manual_id = origin_from = None
             try:
                 manual_id = parse_statistic_id(current_manual)
             except ValueError:
                 errors[CONF_MANUAL_STATISTIC_ID] = "invalid_statistic_id"
-            else:
+            try:
+                origin_from = parse_origin_from(current_from)
+            except ValueError:
+                errors[CONF_ORIGIN_FROM_DATE] = "invalid_date"
+            if not errors:
                 reset = bool(user_input.get(CONF_RESET_STATISTICS))
                 coordinator = getattr(self.config_entry, "runtime_data", None)
-                if reset and not manual_id:
+                if reset and not (manual_id or origin_from):
                     errors[CONF_RESET_STATISTICS] = "reset_needs_statistic"
                 elif reset and coordinator is None:
                     errors[CONF_RESET_STATISTICS] = "reset_not_loaded"
@@ -263,6 +272,8 @@ class OriginEnergyOptionsFlow(OptionsFlow):
                 # cleared.
                 if manual_id:
                     data[CONF_MANUAL_STATISTIC_ID] = manual_id
+                if origin_from:
+                    data[CONF_ORIGIN_FROM_DATE] = origin_from
                 if reset:
                     # Saved first so the coordinator sees the new id, then
                     # the one-time clear runs. The tick-box itself is not
@@ -271,7 +282,7 @@ class OriginEnergyOptionsFlow(OptionsFlow):
                         self.config_entry, options=data
                     )
                     try:
-                        await coordinator.async_reset_for_manual_statistic(manual_id)
+                        await coordinator.async_reset_for_manual_statistic()
                     except ValueError:
                         errors[CONF_MANUAL_STATISTIC_ID] = "invalid_statistic_id"
                     except TimeoutError:
@@ -301,6 +312,10 @@ class OriginEnergyOptionsFlow(OptionsFlow):
                         CONF_MANUAL_STATISTIC_ID,
                         description={"suggested_value": current_manual},
                     ): TextSelector(),
+                    vol.Optional(
+                        CONF_ORIGIN_FROM_DATE,
+                        description={"suggested_value": current_from},
+                    ): DateSelector(),
                     vol.Optional(CONF_RESET_STATISTICS, default=False): BooleanSelector(),
                 }
             ),

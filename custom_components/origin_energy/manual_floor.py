@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from typing import Any
 
 # An entity ("sensor.electricity_meter_total") or an external statistic
@@ -52,6 +52,27 @@ def configured_statistic_id(options: Mapping[str, Any], key: str) -> str | None:
         return None
 
 
+def parse_origin_from(value: Any) -> str | None:
+    """Tidy a user-entered date. None for blank, ValueError if not YYYY-MM-DD."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError as err:
+        raise ValueError(f"Not a valid date: {value!r}") from err
+
+
+def configured_origin_from(options: Mapping[str, Any], key: str) -> str | None:
+    """The fixed start date from stored options, ignoring anything unusable."""
+    try:
+        return parse_origin_from(options.get(key))
+    except ValueError:
+        return None
+
+
 @dataclass(frozen=True)
 class ManualFloor:
     """The last hour the manual statistic already covers."""
@@ -62,6 +83,18 @@ class ManualFloor:
     def first_free_start(self) -> datetime:
         """Start of the first hour Origin is allowed to write."""
         return self.last_start + STATISTIC_PERIOD
+
+
+def floor_from_date(day: str, tz: tzinfo) -> ManualFloor:
+    """The floor for "Origin takes over from local midnight on `day`".
+
+    Expressed as the hour before midnight so first_free_start lands exactly
+    on local midnight, wherever DST puts it in UTC.
+    """
+    midnight = datetime.combine(date.fromisoformat(day), time(0), tzinfo=tz)
+    return ManualFloor(
+        last_start=midnight.astimezone(timezone.utc) - STATISTIC_PERIOD
+    )
 
 
 def floor_from_last_statistics(

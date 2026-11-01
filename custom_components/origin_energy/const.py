@@ -59,6 +59,11 @@ CONF_UPDATE_INTERVAL_HOURS = "update_interval_hours"
 # added. It is only ever read, never written. Also an option, not data, so it
 # can be changed from the Configure dialog at any time.
 CONF_MANUAL_STATISTIC_ID = "manual_statistic_id"
+# Optional fixed date (YYYY-MM-DD, local midnight) from which Origin's data is
+# used. Takes priority over the manual statistic's last row: for a statistic
+# that keeps growing by itself (a live sensor records a row every hour) the
+# last row is always "now", so a fixed date is the only stable cut-off.
+CONF_ORIGIN_FROM_DATE = "origin_from_date"
 # Not stored: a tick-box in the options dialog that clears Origin's own
 # statistics so they are re-imported after the manual statistic.
 CONF_RESET_STATISTICS = "reset_origin_statistics"

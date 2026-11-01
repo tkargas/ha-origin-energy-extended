@@ -58,6 +58,7 @@ from .const import (
     CONF_AGREEMENT_ID,
     CONF_BACKFILL_COMPLETE,
     CONF_MANUAL_STATISTIC_ID,
+    CONF_ORIGIN_FROM_DATE,
     CONF_SESSION_COOKIE,
     CONF_TIME_UNIT,
     CONF_TIMEZONE,
@@ -72,7 +73,9 @@ from .const import (
 )
 from .manual_floor import (
     ManualFloor,
+    configured_origin_from,
     configured_statistic_id,
+    floor_from_date,
     floor_from_last_statistics,
     later_start,
     not_before_floor,
@@ -186,6 +189,9 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
         self._manual_statistic_id = configured_statistic_id(
             config_entry.options, CONF_MANUAL_STATISTIC_ID
         )
+        self._origin_from = configured_origin_from(
+            config_entry.options, CONF_ORIGIN_FROM_DATE
+        )
         self._backfill_task: asyncio.Task[None] | None = None
         # Guards the statistics import so a background backfill and a
         # scheduled update can't interleave and corrupt the running sums.
@@ -222,17 +228,26 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
         statistic_id = configured_statistic_id(
             self.config_entry.options, CONF_MANUAL_STATISTIC_ID
         )
-        if statistic_id == self._manual_statistic_id:
+        origin_from = configured_origin_from(
+            self.config_entry.options, CONF_ORIGIN_FROM_DATE
+        )
+        if (
+            statistic_id == self._manual_statistic_id
+            and origin_from == self._origin_from
+        ):
             return False
         _LOGGER.debug(
-            "Origin Energy manual statistic changed from %s to %s",
+            "Origin Energy manual cut-off changed from %s/%s to %s/%s",
             self._manual_statistic_id,
+            self._origin_from,
             statistic_id,
+            origin_from,
         )
         self._manual_statistic_id = statistic_id
+        self._origin_from = origin_from
         return True
 
-    async def async_reset_for_manual_statistic(self, manual_statistic_id: str) -> None:
+    async def async_reset_for_manual_statistic(self) -> None:
         """Drop Origin's own statistics and re-import them after the manual one.
 
         For when Origin's series already holds hours the manual statistic
@@ -243,9 +258,11 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
         last row, which are deliberately not re-imported.
         """
         own_ids = [self.consumption_statistic_id, self.cost_statistic_id]
-        if manual_statistic_id in own_ids:
+        self.async_adopt_manual_statistic()
+        if self._manual_statistic_id in own_ids:
             raise ValueError("The manual statistic cannot be Origin's own statistic")
-        self._manual_statistic_id = manual_statistic_id
+        if self._manual_statistic_id is None and self._origin_from is None:
+            raise ValueError("Set a manual statistic or a start date first")
 
         if self._backfill_task is not None:
             self._backfill_task.cancel()
@@ -515,13 +532,18 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
             _LOGGER.debug("No new Origin Energy usage data since last update")
 
     async def _async_manual_floor(self) -> ManualFloor | None:
-        """Last hour covered by the user's manual statistic, if one is set.
+        """Last hour covered by the manual data, if a cut-off is configured.
+
+        A fixed start date wins over the statistic: it does not move, which
+        a statistic that grows by itself would.
 
         Raises rather than returning None when the statistic is configured
         but holds nothing: carrying on would write Origin's data over the
         very hours the manual readings were meant to own, and a mistyped id
         is far more likely than an intentionally empty statistic.
         """
+        if self._origin_from is not None:
+            return floor_from_date(self._origin_from, self.timezone)
         statistic_id = self._manual_statistic_id
         if statistic_id is None:
             return None
