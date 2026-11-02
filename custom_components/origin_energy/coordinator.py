@@ -670,8 +670,15 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
         """
         instance = get_instance(self.hass)
         # Statistics are written through the recorder's queue; let the rows
-        # just imported land before reading them back.
-        await instance.async_block_till_done()
+        # just imported land before reading them back. Not during startup:
+        # the recorder only drains its queue once Home Assistant has finished
+        # starting, and the first refresh runs inside setup, so waiting here
+        # would stall startup until bootstrap times out. A total that is one
+        # poll behind is better than that.
+        if self.hass.is_running:
+            with suppress(TimeoutError):
+                async with asyncio.timeout(30):
+                    await instance.async_block_till_done()
         last = await instance.async_add_executor_job(
             get_last_statistics,
             self.hass,
