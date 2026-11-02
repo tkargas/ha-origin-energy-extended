@@ -73,7 +73,9 @@ from .const import (
 from .manual_days import (
     configured_statistic_id,
     days_with_manual_data,
+    end_of_local_day,
     expand_to_local_days,
+    last_manual_entry,
     local_day,
 )
 
@@ -132,10 +134,25 @@ def statistic_slug(value: str) -> str:
 
 
 @dataclass
+class MeterTotal:
+    """A running meter total built from the last manual reading plus Origin."""
+
+    total: float
+    # The manual statistic's reading and the local day it was last changed on;
+    # both None when there is no manual statistic (or it never changed), in
+    # which case `total` is just everything Origin has reported.
+    reading: float | None
+    reading_day: date | None
+    # kWh Origin reported for the days after `reading_day`.
+    origin_kwh: float
+
+
+@dataclass
 class OriginEnergyData:
-    """Small marker object returned to any entities watching the coordinator."""
+    """What entities watching the coordinator read."""
 
     last_updated: datetime
+    meter_total: MeterTotal | None = None
 
 
 @dataclass
@@ -356,10 +373,12 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
         # the import work, and surfaces as a re-auth prompt.
         await self._async_api()
 
+        meter_total = None
         if self.config_entry.data.get(CONF_BACKFILL_COMPLETE):
             try:
                 async with self._import_lock:
                     await self._async_import_recent()
+                meter_total = await self._async_meter_total()
             except OriginEnergyApiError as err:
                 raise UpdateFailed(str(err)) from err
             except (aiohttp.ClientError, TimeoutError) as err:
@@ -370,7 +389,9 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
             # long-standing account.
             self._start_backfill()
 
-        return OriginEnergyData(last_updated=dt_util.utcnow())
+        return OriginEnergyData(
+            last_updated=dt_util.utcnow(), meter_total=meter_total
+        )
 
     # ------------------------------------------------------------------
     # History backfill
@@ -422,6 +443,9 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
             "Origin Energy history backfill complete, %d points imported",
             cursor.written,
         )
+        # The meter total is only worked out on a poll after the backfill, so
+        # ask for one now rather than leaving it blank until the next interval.
+        self.hass.async_create_task(self.async_request_refresh())
 
     async def _async_history_start(self) -> datetime:
         """Earliest instant worth asking for.
@@ -634,6 +658,72 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
             )
             for row in own.get(self.consumption_statistic_id) or []
         }
+
+    async def _async_meter_total(self) -> MeterTotal | None:
+        """The last manual reading plus what Origin reports since.
+
+        Nothing is written anywhere: this only reads the two statistics, so
+        the Energy dashboard is unaffected. Origin's own statistic skips the
+        days the manual statistic covers and carries its running sum straight
+        across them, so the kWh it gained after the manual statistic's last
+        day is the end sum minus the sum at the end of that day.
+        """
+        instance = get_instance(self.hass)
+        # Statistics are written through the recorder's queue; let the rows
+        # just imported land before reading them back.
+        await instance.async_block_till_done()
+        last = await instance.async_add_executor_job(
+            get_last_statistics,
+            self.hass,
+            1,
+            self.consumption_statistic_id,
+            True,
+            {"sum"},
+        )
+        rows = last.get(self.consumption_statistic_id)
+        if not rows:
+            return None
+        end_sum = float(rows[0]["sum"])
+
+        reading: float | None = None
+        reading_day: date | None = None
+        origin_kwh = end_sum
+        if self._manual_statistic_id is not None:
+            manual = await instance.async_add_executor_job(
+                statistics_during_period,
+                self.hass,
+                None,
+                None,
+                {self._manual_statistic_id},
+                "hour",
+                None,
+                {"change", "state"},
+            )
+            entry = last_manual_entry(
+                manual.get(self._manual_statistic_id), self.timezone
+            )
+            if entry is not None:
+                reading_day, reading = entry
+                before = await instance.async_add_executor_job(
+                    statistics_during_period,
+                    self.hass,
+                    None,
+                    end_of_local_day(reading_day, self.timezone),
+                    {self.consumption_statistic_id},
+                    "hour",
+                    None,
+                    {"sum"},
+                )
+                earlier = before.get(self.consumption_statistic_id)
+                base = float(earlier[-1]["sum"]) if earlier else 0.0
+                origin_kwh = max(end_sum - base, 0.0)
+
+        return MeterTotal(
+            total=(reading or 0.0) + origin_kwh,
+            reading=reading,
+            reading_day=reading_day,
+            origin_kwh=origin_kwh,
+        )
 
     # ------------------------------------------------------------------
     # Shared import machinery

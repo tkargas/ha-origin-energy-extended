@@ -136,7 +136,9 @@ from origin_energy.coordinator import OriginEnergyCoordinator, _ImportCursor  # 
 from origin_energy.manual_days import (  # noqa: E402
     configured_statistic_id,
     days_with_manual_data,
+    end_of_local_day,
     expand_to_local_days,
+    last_manual_entry,
     local_day,
     parse_statistic_id,
 )
@@ -183,6 +185,28 @@ try:
 except Exception as err:  # no tz database on this machine
     print(f"  skip Sydney checks ({err.__class__.__name__}: install tzdata to run them)")
 
+def mrow(moment, change, state):
+    return {"start": moment.timestamp(), "change": change, "state": state}
+
+
+check(
+    "last_manual_entry: last changed day + latest reading",
+    last_manual_entry([mrow(hr(22, 12), 5.0, 105.0), mrow(hr(23, 12), 0.0, 105.0), mrow(hr(24, 12), 0.0, 105.0)], UTC),
+    (date(2026, 10, 22), 105.0),
+)
+check(
+    "last_manual_entry: the later of two entries wins",
+    last_manual_entry([mrow(hr(22, 12), 5.0, 105.0), mrow(hr(25, 9), 7.0, 112.0), mrow(hr(26, 0), 0.0, 112.0)], UTC),
+    (date(2026, 10, 25), 112.0),
+)
+check("last_manual_entry: never changed", last_manual_entry([mrow(hr(22, 12), 0.0, 100.0)], UTC), None)
+check("last_manual_entry: no rows", last_manual_entry(None, UTC), None)
+check("end_of_local_day (UTC)", end_of_local_day(date(2026, 10, 22), UTC), hr(23, 0))
+try:
+    check("end_of_local_day (Sydney, AEDT)", end_of_local_day(date(2026, 10, 31), ZoneInfo("Australia/Sydney")), hr(31, 13))
+except Exception as err:  # no tz database on this machine
+    print(f"  skip ({err.__class__.__name__}: install tzdata to run this)")
+
 # --------------------------------------------------------------------------
 # 2. The coordinator against a fake store and a fake Origin
 # --------------------------------------------------------------------------
@@ -199,8 +223,12 @@ class Store:
         self.writes = []  # (statistic_id, start) in order
         self.cleared = []
 
-    def put(self, statistic_id, start, state, total):
-        self.rows.setdefault(statistic_id, {})[start] = {"state": state, "sum": total}
+    def put(self, statistic_id, start, state, total, reading=None):
+        self.rows.setdefault(statistic_id, {})[start] = {
+            "state": state,
+            "sum": total,
+            "reading": reading,
+        }
 
     def snapshot(self, statistic_id):
         return {s: dict(r) for s, r in self.rows.get(statistic_id, {}).items()}
@@ -219,9 +247,11 @@ class Store:
             ordered = sorted(self.rows.get(sid, {}).items())
             got = []
             for i, (s, r) in enumerate(ordered):
-                if not (start <= s < end):
+                if (start is not None and s < start) or (end is not None and s >= end):
                     continue
                 entry = {"start": s.timestamp(), "sum": r["sum"]}
+                if types_ and "state" in types_:
+                    entry["state"] = r["reading"]
                 if types_ and "change" in types_:
                     # like HA: relative to the row before it (the first row ever is its own state)
                     entry["change"] = r["sum"] - ordered[i - 1][1]["sum"] if i else r["state"]
@@ -229,6 +259,9 @@ class Store:
             if got:
                 out[sid] = got
         return out
+
+    async def block_till_done(self):
+        self.blocked = getattr(self, "blocked", 0) + 1
 
     def clear(self, statistic_ids):
         self.cleared = list(statistic_ids)
@@ -284,6 +317,7 @@ def make(store, origin, manual_id=None, tz=UTC):
         get_instance=lambda hass: types.SimpleNamespace(
             async_add_executor_job=_run_job,
             async_clear_statistics=store.clear,
+            async_block_till_done=store.block_till_done,
         ),
         get_last_statistics=store.get_last_statistics,
         statistics_during_period=store.statistics_during_period,
@@ -328,7 +362,7 @@ def manual_series(store, first, last, entries=None, base=1000.0):
     while h <= last:
         amount = entries.get(h, 0.0)
         total += amount
-        store.put(MANUAL, h, amount, total)
+        store.put(MANUAL, h, amount, total, reading=total)
         h += timedelta(hours=1)
 
 
@@ -509,6 +543,69 @@ check("set -> True", c.async_adopt_manual_statistic(), True)
 check("then stable -> False", c.async_adopt_manual_statistic(), False)
 c.config_entry.options = {}
 check("cleared -> True", c.async_adopt_manual_statistic(), True)
+
+# ---- K: the meter total ------------------------------------------------------------
+print("K. meter total = last manual reading + Origin's usage after the last manual day")
+store = Store()
+# entries on the 22nd (reading 1021.5) and 27th (reading 1046.5); sensor holds 1046.5 after
+manual_series(store, hr(20, 0), hr(30, 9), {hr(22, 12): 21.5, hr(27, 20): 25.0})
+manual_before = store.snapshot(MANUAL)
+origin = FakeOrigin(hr(20, 0), hr(29, 23))
+c = make(store, origin, MANUAL)
+run(c._async_backfill())
+own_before = store.snapshot(OWN)
+mt = run(c._async_meter_total())
+after_27 = sum(origin.wh(h) / 1000 for h in day_hours(28, 29))
+check("reading is the sensor's latest state", mt.reading, 1046.5)
+check("reading day is the last day with an entry", mt.reading_day, date(2026, 10, 27))
+check("origin kWh counts only the days after it", abs(mt.origin_kwh - after_27) < 1e-9, True)
+check("total = reading + origin kWh", abs(mt.total - (1046.5 + after_27)) < 1e-9, True)
+check("recorder was drained before reading", getattr(store, "blocked", 0) >= 1, True)
+check("nothing was written", store.snapshot(OWN) == own_before and store.snapshot(MANUAL) == manual_before, True)
+
+# a new day of Origin data moves the total by exactly that day
+origin.last = hr(30, 5)
+run(c._async_import_recent())
+mt2 = run(c._async_meter_total())
+check("total rises by the new hours", abs((mt2.total - mt.total) - sum(origin.wh(h) / 1000 for h in hours(hr(30, 0), hr(30, 5)))) < 1e-9, True)
+
+# a newer manual entry rebases the total onto it
+manual_series(store, hr(20, 0), hr(30, 9), {hr(22, 12): 21.5, hr(27, 20): 25.0, hr(29, 18): 6.0})
+mt3 = run(c._async_meter_total())
+check("new entry: reading rebased", mt3.reading, 1052.5)
+check("new entry: reading day moves", mt3.reading_day, date(2026, 10, 29))
+check("new entry: only Origin's usage after that day is added", abs(mt3.origin_kwh - sum(origin.wh(h) / 1000 for h in hours(hr(30, 0), hr(30, 5)))) < 1e-9, True)
+
+# no manual statistic: just what Origin reported
+store = Store()
+origin = FakeOrigin(hr(20, 0), hr(29, 23))
+c = make(store, origin, None)
+run(c._async_backfill())
+mt = run(c._async_meter_total())
+check("no manual statistic: total is Origin's whole sum", abs(mt.total - sum(origin.wh(h) / 1000 for h in day_hours(20, 21, 22, 23, 24, 25, 26, 27, 28, 29))) < 1e-9, True)
+check("no manual statistic: no reading", (mt.reading, mt.reading_day), (None, None))
+
+# manual stat that never changed: same as none
+store = Store()
+manual_series(store, hr(20, 0), hr(30, 9))
+origin = FakeOrigin(hr(20, 0), hr(29, 23))
+c = make(store, origin, MANUAL)
+run(c._async_backfill())
+mt = run(c._async_meter_total())
+check("manual statistic never changed: total is Origin's whole sum", mt.reading is None and abs(mt.total - mt.origin_kwh) < 1e-9, True)
+
+# Origin has nothing yet
+c = make(Store(), FakeOrigin(hr(20, 0), hr(29, 23)), None)
+check("no Origin statistics: no total", run(c._async_meter_total()), None)
+
+# manual days that run unbroken from before Origin's first row to the last entry
+store = Store()
+manual_series(store, hr(20, 0), hr(30, 9), {hr(d, 12): 20.0 for d in range(20, 26)})
+origin = FakeOrigin(hr(20, 0), hr(29, 23))
+c = make(store, origin, MANUAL)
+run(c._async_backfill())
+mt = run(c._async_meter_total())
+check("entries every day up to the 25th: Origin counts from the 26th", abs(mt.origin_kwh - sum(origin.wh(h) / 1000 for h in day_hours(26, 27, 28, 29))) < 1e-9, True)
 
 print()
 if FAILURES:

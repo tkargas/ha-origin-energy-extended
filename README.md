@@ -180,6 +180,25 @@ day may still be downloaded, but it is not added to the statistics.
   writing over your manual days. Clear the field to go back to importing
   everything.
 
+### Seeing a meter total
+
+The integration adds a sensor, **Electricity meter total**
+(`sensor.origin_energy_electricity_meter_total`), so you can watch a running
+meter reading without typing it in:
+
+> last reading in your manual statistic + what Origin has reported since the
+> last day that statistic recorded usage
+
+It is updated on every poll. It only reads the two statistics and has no
+state class, so Home Assistant records no statistics for it and the Energy
+dashboard cannot use it: nothing is counted twice. Its attributes show the
+reading and day it started from and the kWh Origin added since.
+
+- When you enter a new reading it starts again from that reading.
+- The reading is taken as the end of the day you entered it, so usage later
+  that same day is not included until the next reading.
+- With no manual statistic it is simply the total Origin has reported.
+
 ## Limitations
 
 Measured against a live account, not assumed —

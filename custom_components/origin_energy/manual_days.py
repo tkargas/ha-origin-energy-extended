@@ -80,6 +80,39 @@ def days_with_manual_data(
     return frozenset(days)
 
 
+def last_manual_entry(
+    rows: Iterable[Mapping[str, Any]] | None, tz: tzinfo
+) -> tuple[date, float] | None:
+    """The last day the manual statistic changed, and its reading now.
+
+    `rows` is ``statistics_during_period(..., "hour", None, {"change", "state"})``
+    output, oldest first. The reading is the statistic's latest ``state``: once
+    nobody is entering anything the sensor just holds its last value, so that
+    is the last reading entered. None when it never changed.
+    """
+    ordered = list(rows or ())
+    last_day: date | None = None
+    for row in ordered:
+        change = row.get("change")
+        if change is None or abs(float(change)) < MIN_CHANGE:
+            continue
+        start = datetime.fromtimestamp(float(row["start"]), tz=timezone.utc)
+        last_day = local_day(start, tz)
+    if last_day is None:
+        return None
+    for row in reversed(ordered):
+        if row.get("state") is not None:
+            return last_day, float(row["state"])
+    return None
+
+
+def end_of_local_day(day: date, tz: tzinfo) -> datetime:
+    """The instant `day` ends in `tz` (the next local midnight), as UTC."""
+    return datetime.combine(day + timedelta(days=1), time(0), tzinfo=tz).astimezone(
+        timezone.utc
+    )
+
+
 def expand_to_local_days(
     start: datetime, end: datetime, tz: tzinfo
 ) -> tuple[datetime, datetime]:
