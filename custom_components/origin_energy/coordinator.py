@@ -15,7 +15,7 @@ import logging
 import re
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, tzinfo
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -93,6 +93,10 @@ COST_TO_DOLLARS = {"CENT": 0.01, "DOLLAR": 1.0}
 # How far back to look for the statistic preceding a re-imported window.
 # Comfortably longer than OVERLAP_DAYS so a daily poll always finds it.
 BASELINE_LOOKBACK_DAYS = 30
+
+# Statistics queries need a real start time (None is not accepted), and the
+# meter total reads a series from its beginning.
+EARLIEST_STATISTIC = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
 # Mint a new access token once the current one is within this of expiring.
 # Tokens last an hour and a long backfill can outlive one, which would
@@ -699,7 +703,7 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
             manual = await instance.async_add_executor_job(
                 statistics_during_period,
                 self.hass,
-                None,
+                EARLIEST_STATISTIC,
                 None,
                 {self._manual_statistic_id},
                 "hour",
@@ -714,7 +718,7 @@ class OriginEnergyCoordinator(DataUpdateCoordinator[OriginEnergyData]):
                 before = await instance.async_add_executor_job(
                     statistics_during_period,
                     self.hass,
-                    None,
+                    EARLIEST_STATISTIC,
                     end_of_local_day(reading_day, self.timezone),
                     {self.consumption_statistic_id},
                     "hour",

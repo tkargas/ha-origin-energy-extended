@@ -247,7 +247,8 @@ class Store:
             ordered = sorted(self.rows.get(sid, {}).items())
             got = []
             for i, (s, r) in enumerate(ordered):
-                if (start is not None and s < start) or (end is not None and s >= end):
+                assert start is not None, "HA's statistics_during_period needs a real start_time"
+                if s < start or (end is not None and s >= end):
                     continue
                 entry = {"start": s.timestamp(), "sum": r["sum"]}
                 if types_ and "state" in types_:
